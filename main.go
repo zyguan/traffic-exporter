@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -47,7 +48,9 @@ type AppMetrics struct {
 
 func main() {
 	initGlobal()
-	go startServePrometheus()
+
+	prometheus.MustRegister(TrafficPacketDataBytes)
+	prometheus.MustRegister(TrafficDroppedPackets)
 
 	handle, err := pcap.OpenLive(G.Options.Interface, 65536, true, pcap.BlockForever)
 	if err != nil {
@@ -57,48 +60,48 @@ func main() {
 	if err != nil {
 		log.Fatal("set bpf filter: ", err)
 	}
-	src := gopacket.NewPacketSource(handle, handle.LinkType())
-	for pkt := range src.Packets() {
-		networkLayer := pkt.NetworkLayer()
-		if networkLayer == nil {
-			continue
-		}
-		transportLayer := pkt.TransportLayer()
-		if transportLayer == nil {
-			continue
-		}
-		networkFlow := networkLayer.NetworkFlow()
-		transportFlow := transportLayer.TransportFlow()
-		srcKey := AppKey{networkFlow.Src().String(), transportFlow.Src().String()}
-		if m, ok := G.Index[srcKey]; ok {
-			m.In.Observe(float64(len(transportLayer.LayerPayload())))
-			continue
-		}
-		dstKey := AppKey{networkFlow.Dst().String(), transportFlow.Dst().String()}
-		if m, ok := G.Index[dstKey]; ok {
-			m.Out.Observe(float64(len(transportLayer.LayerPayload())))
-			continue
-		}
-		TrafficDroppedPackets.WithLabelValues(srcKey.IP+":"+srcKey.Port, dstKey.IP+":"+dstKey.Port).Inc()
+	pkts := gopacket.NewPacketSource(handle, handle.LinkType()).Packets()
+	for i := 0; i < G.Options.Workers; i++ {
+		go func() {
+			for pkt := range pkts {
+				networkLayer := pkt.NetworkLayer()
+				if networkLayer == nil {
+					continue
+				}
+				transportLayer := pkt.TransportLayer()
+				if transportLayer == nil {
+					continue
+				}
+				networkFlow := networkLayer.NetworkFlow()
+				transportFlow := transportLayer.TransportFlow()
+				srcKey := AppKey{networkFlow.Src().String(), transportFlow.Src().String()}
+				if m, ok := G.Index[srcKey]; ok {
+					m.In.Observe(float64(len(transportLayer.LayerPayload())))
+					continue
+				}
+				dstKey := AppKey{networkFlow.Dst().String(), transportFlow.Dst().String()}
+				if m, ok := G.Index[dstKey]; ok {
+					m.Out.Observe(float64(len(transportLayer.LayerPayload())))
+					continue
+				}
+				TrafficDroppedPackets.WithLabelValues(srcKey.IP+":"+srcKey.Port, dstKey.IP+":"+dstKey.Port).Inc()
+			}
+		}()
 	}
+
+	http.Handle("/metrics", promhttp.Handler())
+	log.Print("listen on ", G.Options.Addr)
+	log.Fatal(http.ListenAndServe(G.Options.Addr, nil))
 }
 
 var (
-	TrafficDataBytes = prometheus.NewSummaryVec(prometheus.SummaryOpts{
-		Name: "traffic_data_bytes",
+	TrafficPacketDataBytes = prometheus.NewSummaryVec(prometheus.SummaryOpts{
+		Name: "traffic_packet_data_bytes",
 	}, []string{"app", "dst", "dir", "src_zone", "dst_zone", "cross_zone"})
 	TrafficDroppedPackets = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "traffic_dropped_packets_total",
 	}, []string{"src", "dst"})
 )
-
-func startServePrometheus() {
-	prometheus.MustRegister(TrafficDataBytes)
-	prometheus.MustRegister(TrafficDroppedPackets)
-	http.Handle("/metrics", promhttp.Handler())
-	log.Print("listen on ", G.Options.Addr)
-	log.Fatal(http.ListenAndServe(G.Options.Addr, nil))
-}
 
 var G struct {
 	Options struct {
@@ -106,6 +109,7 @@ var G struct {
 		Config    string
 		Zone      string
 		Addr      string
+		Workers   int
 	}
 	Config  Config
 	Current int
@@ -117,8 +121,12 @@ func initGlobal() {
 	flag.StringVar(&G.Options.Interface, "i", "eth0", "interface to watch")
 	flag.StringVar(&G.Options.Config, "c", "config.json", "config file")
 	flag.StringVar(&G.Options.Zone, "z", Undefined, "zone of current node")
-	flag.StringVar(&G.Options.Addr, "a", ":3000", "listen address")
+	flag.StringVar(&G.Options.Addr, "a", ":6060", "listen address")
+	flag.IntVar(&G.Options.Workers, "w", runtime.NumCPU(), "number of workers")
 	flag.Parse()
+	if G.Options.Workers < 1 {
+		G.Options.Workers = 1
+	}
 
 	iface, err := net.InterfaceByName(G.Options.Interface)
 	if err != nil {
@@ -198,8 +206,8 @@ func initIndex() {
 		for _, app := range node.Apps {
 			key := AppKey{node.IP, strconv.Itoa(int(app.Port))}
 			name := key.IP + ":" + key.Port
-			in := TrafficDataBytes.WithLabelValues(app.Role, name, "in", G.Options.Zone, node.Zone, isCrossZone(node))
-			out := TrafficDataBytes.WithLabelValues(app.Role, name, "out", G.Options.Zone, node.Zone, isCrossZone(node))
+			in := TrafficPacketDataBytes.WithLabelValues(app.Role, name, "in", G.Options.Zone, node.Zone, isCrossZone(node))
+			out := TrafficPacketDataBytes.WithLabelValues(app.Role, name, "out", G.Options.Zone, node.Zone, isCrossZone(node))
 			G.Index[key] = &AppMetrics{in, out}
 		}
 	}
